@@ -1,0 +1,63 @@
+# Import required libraries
+import requests
+import pandas as pd
+from io import StringIO
+
+# GitHub raw file URL
+github_url = "https://raw.githubusercontent.com/LandbruksdirektoratetGIT/opendata/refs/heads/main/datasets/produksjon-og-avlosertilskudd/2025/dataset.csv"
+
+# Download the CSV content
+response = requests.get(github_url)
+response.encoding = 'utf-8'
+csv_content = response.text
+
+# Read into pandas with more flexible parsing options
+pandas_df = pd.read_csv(
+    StringIO(csv_content),
+    sep=';',  # Try semicolon as delimiter (common in Norwegian datasets)
+    encoding='utf-8',
+    on_bad_lines='skip',  # Skip problematic lines
+    engine='python',  # Use Python engine for more flexibility
+    quoting=1  # QUOTE_ALL
+)
+
+# If semicolon didn't work, try comma
+if len(pandas_df.columns) == 1:
+    pandas_df = pd.read_csv(
+        StringIO(csv_content),
+        sep=',',
+        encoding='utf-8',
+        on_bad_lines='skip',
+        engine='python'
+    )
+
+# Convert pandas DataFrame to PySpark DataFrame
+df = spark.createDataFrame(pandas_df)
+
+# Display the DataFrame
+display(df)
+
+# Show schema
+df.printSchema()
+
+# Show first few rows
+df.show(5, truncate=False)
+
+# Get row count
+print(f"Total rows: {df.count()}")
+
+# Get column names
+print(f"Columns: {df.columns}")
+
+# Write to Lakehouse as Delta table
+table_name = "produksjon_avlosertilskudd_2025"
+
+# Write the DataFrame to a Delta table
+df.write.format("delta") \
+    .mode("overwrite") \
+    .saveAsTable(table_name)
+
+print(f"Table '{table_name}' has been created in your Lakehouse!")
+
+# Verify the table was created
+spark.sql(f"SELECT * FROM {table_name} LIMIT 10").show()
