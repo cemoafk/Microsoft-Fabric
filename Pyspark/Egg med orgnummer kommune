@@ -1,0 +1,260 @@
+# ============================================
+# EGG DATA WITH KOMMUNENUMMER - COMPLETE VERSION
+# ============================================
+import requests
+import pandas as pd
+from io import StringIO
+import re
+from pyspark.sql import functions as F
+from pyspark.sql.functions import col
+import time
+
+print("="*60)
+print("LOADING EGG DATA AND MATCHING WITH KOMMUNENUMMER")
+print("="*60)
+
+# ============================================
+# STEP 1: Load Egg Data from GitHub
+# ============================================
+print("\n[1/5] Loading egg data from GitHub...")
+
+github_url = "https://raw.githubusercontent.com/LandbruksdirektoratetGIT/opendata/refs/heads/main/datasets/leveransedata-egg/2024/dataset.csv"
+
+response = requests.get(github_url)
+response.encoding = 'utf-8'
+csv_content = response.text
+
+pandas_df = pd.read_csv(
+    StringIO(csv_content),
+    sep=';',
+    encoding='utf-8',
+    on_bad_lines='skip',
+    engine='python',
+    quoting=1
+)
+
+if len(pandas_df.columns) == 1:
+    pandas_df = pd.read_csv(
+        StringIO(csv_content),
+        sep=',',
+        encoding='utf-8',
+        on_bad_lines='skip',
+        engine='python'
+    )
+
+# Clean column names
+def clean_column_name(col_name):
+    col_name = col_name.replace('æ', 'ae').replace('ø', 'o').replace('å', 'a')
+    col_name = col_name.replace('Æ', 'Ae').replace('Ø', 'O').replace('Å', 'A')
+    col_name = re.sub(r'[,;{}()\n\t=\s]+', '_', col_name)
+    col_name = col_name.strip('_')
+    return col_name
+
+pandas_df.columns = [clean_column_name(col) for col in pandas_df.columns]
+
+print(f"✓ Columns: {pandas_df.columns.tolist()}")
+print(f"✓ Loaded {len(pandas_df)} rows")
+
+# Convert to PySpark
+egg_df = spark.createDataFrame(pandas_df)
+
+# Clean up the producer org number column name
+for old_col in egg_df.columns:
+    if 'produsentorgnr' in old_col.lower():
+        egg_df = egg_df.withColumnRenamed(old_col, "Produsentorgnr")
+        print(f"✓ Found producer org column: {old_col} -> Produsentorgnr")
+        break
+
+print("\nSample of egg data:")
+egg_df.show(5, truncate=False)
+
+# ============================================
+# STEP 2: Get Unique Organization Numbers from Egg Data
+# ============================================
+print("\n[2/5] Finding unique organizations in egg data...")
+
+unique_orgnr = egg_df.select("Produsentorgnr").distinct().toPandas()
+unique_orgnr_list = unique_orgnr['Produsentorgnr'].tolist()
+
+print(f"✓ Found {len(unique_orgnr_list)} unique egg producers")
+print(f"Sample org numbers: {unique_orgnr_list[:5]}")
+
+# ============================================
+# STEP 3: Fetch Data for Specific Organizations
+# ============================================
+print("\n[3/5] Fetching kommune data for each egg producer...")
+print("(This will take a few minutes...)")
+
+all_enheter = []
+batch_size = 50
+failed_orgnr = []
+
+for i in range(0, len(unique_orgnr_list), batch_size):
+    batch = unique_orgnr_list[i:i+batch_size]
+    
+    for orgnr in batch:
+        try:
+            url = f"https://data.brreg.no/enhetsregisteret/api/enheter/{orgnr}"
+            response = requests.get(url, timeout=10)
+            
+            if response.status_code == 200:
+                enhet = response.json()
+                all_enheter.append(enhet)
+            elif response.status_code == 404:
+                failed_orgnr.append(orgnr)
+            else:
+                failed_orgnr.append(orgnr)
+            
+            time.sleep(0.05)  # Small delay to avoid rate limiting
+            
+        except Exception as e:
+            failed_orgnr.append(orgnr)
+            continue
+    
+    if (i + batch_size) % 200 == 0:
+        print(f"  Processed {min(i + batch_size, len(unique_orgnr_list))}/{len(unique_orgnr_list)} organizations...")
+
+print(f"\n✓ Successfully fetched: {len(all_enheter)} organizations")
+print(f"⚠ Failed/Not found: {len(failed_orgnr)} organizations")
+
+if len(failed_orgnr) > 0:
+    print(f"Sample of failed org numbers: {failed_orgnr[:5]}")
+
+# Convert to DataFrame
+pandas_enheter = pd.json_normalize(all_enheter)
+pandas_enheter.columns = [clean_column_name(col) for col in pandas_enheter.columns]
+
+for col_name in pandas_enheter.columns:
+    pandas_enheter[col_name] = pandas_enheter[col_name].astype(str)
+
+enhetsreg_df = spark.createDataFrame(pandas_enheter)
+
+# Save for future use
+enhetsreg_df.write.format("delta") \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable("enhetsregisteret_egg_producers")
+
+print(f"✓ Saved to table 'enhetsregisteret_egg_producers'")
+
+# ============================================
+# STEP 4: Clean and Join
+# ============================================
+print("\n[4/5] Joining egg data with kommune information...")
+
+# Clean organization numbers
+egg_df = egg_df.withColumn(
+    "Produsentorgnr_clean",
+    F.lpad(F.trim(col("Produsentorgnr")), 9, "0")
+)
+
+enhetsreg_df = enhetsreg_df.withColumn(
+    "organisasjonsnummer_clean",
+    F.lpad(F.trim(col("organisasjonsnummer")), 9, "0")
+)
+
+# Select columns from Enhetsregisteret
+enhetsreg_select = enhetsreg_df.select(
+    col("organisasjonsnummer_clean"),
+    col("navn").alias("bedrift_navn"),
+    col("`forretningsadresse.kommune`").alias("kommune"),
+    col("`forretningsadresse.kommunenummer`").alias("kommunenummer"),
+    col("`forretningsadresse.poststed`").alias("poststed")
+)
+
+# Join
+egg_with_kommune = egg_df.join(
+    enhetsreg_select,
+    egg_df["Produsentorgnr_clean"] == enhetsreg_select["organisasjonsnummer_clean"],
+    "left"
+)
+
+# Check matching statistics
+total_rows = egg_with_kommune.count()
+matched_rows = egg_with_kommune.filter(col("kommunenummer").isNotNull()).count()
+unmatched_rows = total_rows - matched_rows
+
+print(f"\n✓ Join complete:")
+print(f"  Total rows: {total_rows}")
+print(f"  Matched: {matched_rows} ({matched_rows/total_rows*100:.1f}%)")
+print(f"  Unmatched: {unmatched_rows} ({unmatched_rows/total_rows*100:.1f}%)")
+
+# Show sample of matched data
+print("\n✓ Sample of MATCHED data:")
+egg_with_kommune.filter(col("kommunenummer").isNotNull()).select(
+    "kommunenummer", "kommune", "Produsentorgnr", "Produsentnavn", "Mengde_egg_totalt_kg"
+).show(10, truncate=False)
+
+if unmatched_rows > 0:
+    print("\n⚠ Sample of UNMATCHED data (these org numbers not found in registry):")
+    egg_with_kommune.filter(col("kommunenummer").isNull()).select(
+        "Produsentorgnr", "Produsentnavn"
+    ).distinct().show(10, truncate=False)
+
+# ============================================
+# STEP 5: Create Final Dataset
+# ============================================
+print("\n[5/5] Creating final dataset...")
+
+final_egg_data = egg_with_kommune.select(
+    col("kommunenummer"),
+    col("kommune"),
+    col("poststed"),
+    col("Leveransear"),
+    col("Leveransemaned"),
+    col("Produsentorgnr"),
+    col("Produsentnavn"),
+    col("bedrift_navn"),
+    col("Mengde_egg_konv_kg"),
+    col("Mengde_egg_oko_kg"),
+    col("Mengde_egg_totalt_kg")
+)
+
+# Save main table
+final_egg_data.write.format("delta") \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable("egg_data_med_kommune_2024")
+
+print(f"✓ Table 'egg_data_med_kommune_2024' saved ({final_egg_data.count()} rows)")
+
+# Show distribution of kommuner
+print("\n✓ Number of unique kommuner in dataset:")
+kommune_count = final_egg_data.filter(col("kommunenummer").isNotNull()) \
+    .select("kommunenummer", "kommune").distinct().count()
+print(f"  {kommune_count} different kommuner")
+
+# Summary by kommune
+kommune_summary = final_egg_data.filter(col("kommunenummer").isNotNull()).groupBy(
+    "kommunenummer", "kommune"
+).agg(
+    F.sum(col("Mengde_egg_totalt_kg").cast("double")).alias("total_kg"),
+    F.sum(col("Mengde_egg_konv_kg").cast("double")).alias("konvensjonell_kg"),
+    F.sum(col("Mengde_egg_oko_kg").cast("double")).alias("okologisk_kg"),
+    F.count("*").alias("antall_leveranser"),
+    F.countDistinct("Produsentorgnr").alias("antall_produsenter")
+)
+
+kommune_summary.write.format("delta") \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable("egg_summary_by_kommune_2024")
+
+print(f"\n✓ Table 'egg_summary_by_kommune_2024' saved")
+
+print("\n✓ Top 15 kommuner by egg production:")
+kommune_summary.orderBy(col("total_kg").desc()).show(15, truncate=False)
+
+# ============================================
+# SUMMARY
+# ============================================
+print("\n" + "="*60)
+print("✓ COMPLETED!")
+print("="*60)
+print(f"\nMatching rate: {matched_rows/total_rows*100:.1f}%")
+print(f"Unique kommuner: {kommune_count}")
+print("\nTables created:")
+print("  1. egg_data_med_kommune_2024")
+print("  2. egg_summary_by_kommune_2024")
+print("  3. enhetsregisteret_egg_producers")
+print("="*60)
